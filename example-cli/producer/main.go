@@ -5,10 +5,8 @@ import (
 	"log"
 	"os"
 	"strconv"
-	"sync"
-	"time"
 
-	"github.com/confluentinc/confluent-kafka-go/kafka"
+	"github.com/Shopify/sarama"
 )
 
 func main() {
@@ -22,71 +20,40 @@ func main() {
 	topic := os.Args[2]
 	partitions, err := strconv.Atoi(os.Args[3])
 	messagesCount, _ := strconv.Atoi(os.Args[4])
-
 	if err != nil {
 		log.Panic(err)
 	}
 
-	//https://github.com/edenhill/librdkafka/blob/master/CONFIGURATION.md
-	//we try to "kill" the kafkas performance by sending one message
-	// at a time, for demo purposes
-	p, err := kafka.NewProducer(&kafka.ConfigMap{
-		"bootstrap.servers":       broker,
-		"queue.buffering.max.ms":  5,
-		"go.events.channel.size":  100,
-		"go.produce.channel.size": 10,
-	})
-
+	config := sarama.NewConfig()
+	config.Version = sarama.V2_0_0_0
+	admin, err := sarama.NewClusterAdmin([]string{broker}, config)
 	if err != nil {
-		fmt.Printf("Failed to create producer: %s\n", err)
-		os.Exit(1)
+		log.Panic(err)
+	}
+	defer admin.Close()
+
+	err = admin.CreateTopic(topic, &sarama.TopicDetail{
+		NumPartitions:     int32(partitions),
+		ReplicationFactor: 1,
+	}, true)
+	if err != nil && err != sarama.ErrTopicAlreadyExists {
+		log.Panic(err)
 	}
 
-	createTopic(broker, topic, partitions, 1)
-	fmt.Printf("Created Producer %v\n", p)
+	producer, err := sarama.NewSyncProducer([]string{broker}, nil)
+	if err != nil {
+		log.Fatalln(err)
+	}
+	defer producer.Close()
 
-	wg := &sync.WaitGroup{}
-	wg.Add(messagesCount)
-
-	go report(p, wg)
-	write(p, "Hello kafka!", topic, messagesCount)
-
-	wg.Wait()
-	p.Close()
-}
-
-var write = func(p *kafka.Producer, msg, topic string, count int) {
-
-	for i := 0; i < count; i++ {
-		message := &kafka.Message{
-			TopicPartition: kafka.TopicPartition{
-				Topic:     &topic,
-				Partition: kafka.PartitionAny,
-			},
-			Value: []byte(msg),
-			Key:   []byte(time.Now().UTC().String()),
+	for i := 0; i < messagesCount; i++ {
+		msg := &sarama.ProducerMessage{Topic: topic, Value: sarama.StringEncoder("Hello Kafka!!!")}
+		partition, offset, err := producer.SendMessage(msg)
+		if err != nil {
+			log.Printf("FAILED to send message: %s\n", err)
+		} else {
+			log.Printf("> message sent to partition %d at offset %d\n", partition, offset)
 		}
-
-		//blocks when is full, see go.produce.channel.size
-		p.ProduceChannel() <- message
 	}
 
-}
-
-var report = func(p *kafka.Producer, wg *sync.WaitGroup) {
-	for e := range p.Events() {
-		switch ev := e.(type) {
-		case *kafka.Message:
-			m := ev
-			if m.TopicPartition.Error != nil {
-				fmt.Printf("Delivery failed: %v\n", m.TopicPartition.Error)
-			} else {
-				fmt.Printf("Delivered message to topic %s [%d] at offset %v\n",
-					*m.TopicPartition.Topic, m.TopicPartition.Partition, m.TopicPartition.Offset)
-			}
-		default:
-			fmt.Printf("Ignored event: %s\n", ev)
-		}
-		wg.Done()
-	}
 }
